@@ -1,0 +1,90 @@
+# Builds libghostty-vt alone from a Ghostty release and publishes it as a
+# release of this repository. Pushing a tag vX.Y.Z builds Ghostty's tag
+# vX.Y.Z; a rebuild of the same version is vX.Y.Z-rN. Everything is
+# cross-compiled from one Linux runner, as Ghostty's own CI does.
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      ghostty_ref:
+        description: Ghostty tag to build (no release is published)
+        required: true
+        default: v1.4.0
+
+env:
+  ZIG_VERSION: 0.17.0
+  GHOSTTY_REPOSITORY: https://github.com/ghostty-org/ghostty.git
+  # x86_64-windows-msvc cannot be cross-compiled (Ghostty's CI notes the
+  # missing MSVC headers); the GNU build's DLL and import library load from
+  # MSVC-linked programs.
+  TARGETS: aarch64-macos x86_64-macos x86_64-windows-gnu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Choose the Ghostty tag
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            ref='${{ inputs.ghostty_ref }}'
+          else
+            ref="${GITHUB_REF_NAME%%-r*}"
+          fi
+          echo "GHOSTTY_REF=$ref" >> "$GITHUB_ENV"
+
+      - name: Install Zig
+        run: |
+          set -eu
+          curl -fsSL https://ziglang.org/download/index.json -o zig-index.json
+          url=$(python3 -c "import json; print(json.load(open('zig-index.json'))['$ZIG_VERSION']['x86_64-linux']['tarball'])")
+          sum=$(python3 -c "import json; print(json.load(open('zig-index.json'))['$ZIG_VERSION']['x86_64-linux']['shasum'])")
+          curl -fsSL "$url" -o zig.tar.xz
+          echo "$sum  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf zig.tar.xz -C "$RUNNER_TEMP/zig" --strip-components=1
+          rm zig.tar.xz
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+
+      - name: Clone Ghostty
+        run: |
+          git clone --depth 1 --branch "$GHOSTTY_REF" "$GHOSTTY_REPOSITORY" ghostty
+          echo "GHOSTTY_COMMIT=$(git -C ghostty rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: ghostty
+        run: |
+          set -eu
+          mkdir -p ../dist
+          for target in $TARGETS; do
+            rm -rf zig-out
+            zig build -Demit-lib-vt -Doptimize=ReleaseFast -Dtarget="$target"
+            name="libghostty-vt-$GHOSTTY_REF-$target"
+            mkdir -p "../dist/$name"
+            cp -R zig-out/lib zig-out/include "../dist/$name/"
+            [ -d zig-out/bin ] && cp -R zig-out/bin "../dist/$name/"
+            cp LICENSE "../dist/$name/"
+            printf 'ghostty %s\ncommit %s\nzig %s\ntarget %s\noptimize ReleaseFast\n' \
+              "$GHOSTTY_REF" "$GHOSTTY_COMMIT" "$ZIG_VERSION" "$target" > "../dist/$name/BUILD-INFO"
+            tar -czf "../dist/$name.tar.gz" -C ../dist "$name"
+            rm -rf "../dist/$name"
+          done
+          cd ../dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Publish the release
+        if: github.event_name == 'push'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        run: |
+          set -eu
+          body=$(printf 'libghostty-vt from Ghostty %s (%s), Zig %s, ReleaseFast.' "$GHOSTTY_REF" "$GHOSTTY_COMMIT" "$ZIG_VERSION")
+          id=$(curl -fsS -X POST "$API/releases" -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            -d "$(python3 -c "import json,sys; print(json.dumps({'tag_name': sys.argv[1], 'name': sys.argv[1], 'body': sys.argv[2]}))" "$GITHUB_REF_NAME" "$body")" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+          for file in dist/*.tar.gz dist/SHA256SUMS; do
+            curl -fsS -X POST "$API/releases/$id/assets?name=$(basename "$file")" -H "Authorization: token $TOKEN" \
+              -F "attachment=@$file" > /dev/null
+          done
